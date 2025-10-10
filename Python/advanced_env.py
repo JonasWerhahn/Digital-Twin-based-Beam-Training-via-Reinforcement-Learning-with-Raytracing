@@ -8,13 +8,6 @@ from PIL import Image
 from utils import stdout_redirected
 
 
-# Änderungen:
-# Episoden machen steps nur, wenn das Ziel im Simulationsbereich ist
-# Es gibt nur einen Agenten
-# Rewards nach Verbindung Möglich(+1) oder nicht(-1) (Max Helligkeit über Schwellenwert) oder Ziel außerhalb des Simulationsbereichs(+0)
-# Nur ein Festes Zielobjekt
-# Als Zustand bekommt der Agent Momentane Ausrichtung, Winkel des Empfangenenen Lichtes(argmax Helligkeit), RSS(max Helligkeit des letzten Bildes), Entfernung zum Zielobject
-# Alle Zielobjekte sind gleich hell
 class BlenderEnv():
     def __init__(self, training_episodes, log_path, agent_type, env_name = "advanced_env.blend"):
         # render parameters
@@ -25,7 +18,7 @@ class BlenderEnv():
         self.env_name = env_name
         self.env_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "../Blender")
         self.current_frame = 0
-        self.frame_end = 40 # number of frames in traffic simulation
+        self.frame_end = 40 # maximum number of frames in traffic simulation
         self.training_episodes = training_episodes
         self.log_file = open(log_path, "w")
         self.agent_type = agent_type
@@ -41,7 +34,6 @@ class BlenderEnv():
         if not bpy.data.scenes:
             raise RuntimeError("Keine Szenen in der geladenen Blend-Datei gefunden.")
 
-        # Sicherstellen, dass context.scene gesetzt ist
         if bpy.context.scene is None:
             bpy.context.window.scene = bpy.data.scenes[0]
         
@@ -50,9 +42,9 @@ class BlenderEnv():
         bpy.context.scene.render.resolution_y = self.render_resolution_y
         bpy.data.scenes[0].render.engine = "CYCLES"
         
+        # lst possible frame
         bpy.context.scene.frame_end = self.frame_end
-        
-        # receive camera object from .blend file
+
         self.camera = bpy.data.objects["Cam"]
         
         self.render_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), f"Renders/{self.agent_type}_agent.png")
@@ -65,6 +57,8 @@ class BlenderEnv():
         self.car = bpy.data.objects["Car"]
         self.bus = bpy.data.objects["Bus"]
         self.train = bpy.data.objects["Train"]
+
+        # defines how common certain target types are
         self.target_type_importances = [1, 3, 23, 25, 29]
         
         self.velocity_multiplier = 4000
@@ -181,14 +175,8 @@ class BlenderEnv():
             self.current_frame += 1
             # set state of traffic animation
             bpy.context.scene.frame_set(self.current_frame)
-            
         
-        if(self.current_frame>=self.frame_end):
-            print(f"Episode {self.number_resets}, target {self.target_variations[self.number_resets-1]}")
-            bpy.ops.wm.save_as_mainfile(filepath=f"{self.env_path}/a.blend")
-            #raise IndexError
-        
-        self.look_at_target()
+        self.look_at_target() # beginn episode by rotating camera to target direction
         
         return self.get_state()
     
@@ -218,11 +206,12 @@ class BlenderEnv():
         # set state of traffic animation
         bpy.context.scene.frame_set(self.current_frame)
         
+        # end episode if target leaves environment bounds or frame count exceeds max frame
         terminated = ((not self.is_target_in_bounds()) or self.current_frame>=self.frame_end)
         
         return state, reward, terminated
     
-    # returns current camera rotations
+    # returns current camera rotations, position of brightest pixel of last rendered image, brightness of brightest pixel and distance camera-to-target
     def get_state(self):
         x_rot = math.degrees(self.camera.rotation_euler[0])%360
         z_rot = math.degrees(self.camera.rotation_euler[2])%360
@@ -250,24 +239,22 @@ class BlenderEnv():
 
         masked_pixels = tensor.squeeze(0)[self.antenna_angle_mask]
 
-        # Maximalwert innerhalb der Maske
+        # maximum brightness
         max_value = masked_pixels.max()
 
-        # Alle Koordinaten innerhalb der Maske mit diesem Maximalwert
-        masked_coords = self.antenna_angle_mask.nonzero()  # [N, 2] → (y, x)
-        max_coords = masked_coords[masked_pixels == max_value]
+        masked_coords = self.antenna_angle_mask.nonzero() # every pixel inside mask
+        max_coords = masked_coords[masked_pixels == max_value] # every brightest pixel inside mask
 
-        # Zufällig eine Koordinate auswählen
-        random_index = torch.randint(len(max_coords), (1,))
+        random_index = torch.randint(len(max_coords), (1,)) # random brightest pixel inside mask
         self.last_target_pixel = max_coords[random_index].squeeze().tolist()
         self.last_max_brigthness = masked_pixels.max()*255
         
-        brigthness_threshold = 10.0
+        brigthness_threshold = 10.0 # min brightness where connection between antenna and target would be possible
         
-        if self.last_max_brigthness >= brigthness_threshold: return 1.0
+        if self.last_max_brigthness >= brigthness_threshold: return 1.0 # give reward if connection would be possible
         else: return -1.0
     
-    # returns a clone of certain targets
+    # returns a clone of specific target type
     def clone_target(self, type):
         original = bpy.data.objects[type]
         clone = original.copy()
@@ -308,6 +295,7 @@ class BlenderEnv():
                 total_length += (points[i+1] - points[i]).length
         return total_length
     
+    # defines movement on path
     def init_path(self, path, velocity):
         path_length = self.get_curve_length(path)
         importance = 1
@@ -352,46 +340,50 @@ class BlenderEnv():
             torch.arange(self.render_resolution_y), torch.arange(self.render_resolution_x), indexing='ij'
         )
 
-        # Mittelpunkt und Radius des Inkreises
+        # center an radius of circle
         center_x, center_y = self.render_resolution_x / 2, self.render_resolution_y / 2
         radius = min(self.render_resolution_x, self.render_resolution_y) / 2
 
-        # Abstände zum Mittelpunkt
         distances = torch.sqrt((xx - center_x) ** 2 + (yy - center_y) ** 2)
 
-        # Maske: True innerhalb des Kreises
+        # mask is true inside of circle
         mask = distances <= radius
         return mask
         
     # generates random variations to the environment for every episode
     def generate_env_variations(self):
         for ep in range(self.training_episodes):
-            # choose random agent targets
             if ep%1000==0: print(f"Generating Episode {ep}")
-            target_type = self.choose_target_type()
+
+            target_type = self.choose_target_type() # choose random agent targets
             match target_type:
                 case 0:
+                    # pedestrian
                     pedestrian_index = np.random.randint(0, len(self.pedestrian_points))
                     offset_x = np.random.uniform(high=2.0, low=-2.0)
                     offset_y = np.random.uniform(high=2.0, low=-2.0)
                     
                     self.target_variations.append(["Pedestrian", pedestrian_index, offset_x, offset_y])
                 case 1:
+                    # cyclist
                     path_index = self.choose_path_index(self.cyclist_paths)
                     path_variation = self.generate_path_variation(self.cyclist_paths[path_index])
                     
                     self.target_variations.append(["Cyclist", path_index, path_variation[0], path_variation[1], path_variation[2], path_variation[3]])
                 case 2:
+                    # car
                     path_index = self.choose_path_index(self.car_paths)
                     path_variation = self.generate_path_variation(self.car_paths[path_index])
                     
                     self.target_variations.append(["Car", path_index, path_variation[0], path_variation[1], path_variation[2], path_variation[3]])
                 case 3:
+                    # bus
                     path_index = self.choose_path_index(self.bus_paths)
                     path_variation = self.generate_path_variation(self.bus_paths[path_index])
                     
                     self.target_variations.append(["Bus", path_index, path_variation[0], path_variation[1], path_variation[2], path_variation[3]])
                 case 4:
+                    # train
                     path_index = self.choose_path_index(self.train_paths)
                     path_variation = self.generate_path_variation(self.train_paths[path_index])
                     
@@ -402,10 +394,10 @@ class BlenderEnv():
             obj = bpy.data.objects.get("Google 3D Tiles")
             self.mat_variations.append([])
             for _ in obj.material_slots:
-                diffuse_color = np.random.uniform(0.008, 0.012)
-                glossy_color = np.random.uniform(0.4375, 0.5625)
-                glossy_roughness = np.random.uniform(0.175, 0.225)
-                self.mat_variations[ep].append([diffuse_color, glossy_color, glossy_roughness])
+                diffuse_color = np.random.uniform(0.008, 0.012) # diffusion variation
+                glossy_color = np.random.uniform(0.4375, 0.5625) # variation of strength of specular highlights
+                glossy_roughness = np.random.uniform(0.175, 0.225) # variation of roughness of specular highlights
+                self.mat_variations[ep].append([diffuse_color, glossy_color, glossy_roughness]) # store variation
     
     # generates random variation for target movement of velocity, direction, left-to-right offset and time offset
     def generate_path_variation(self, path):
@@ -464,12 +456,14 @@ class BlenderEnv():
             cur_line += 1
         env_variation_file.close()
         
+    # random target type with different chances for each target
     def choose_target_type(self):
         target_type_score = np.random.randint(0, self.target_type_importances[4])
         for i in range(len(self.target_type_importances)):
             if self.target_type_importances[i] > target_type_score:
                 return i
             
+    # target moves on random path
     def choose_path_index(self, paths):
         sum = 0
         path_importances = []
@@ -482,10 +476,12 @@ class BlenderEnv():
             if path_importances[i] > path_score:
                 return i
     
+    # checks if target left the simulated area
     def is_target_in_bounds(self):
         target_location = self.target.matrix_world.translation
         return ((-500 < target_location[0] < 160) and (-180 < target_location[1] < 250))
     
+    # rotates camera to look at target
     def look_at_target(self):
         direction = self.target.matrix_world.translation - self.camera_pos
         rot_quat = direction.to_track_quat('-Z', 'Y')  # -Z = Blickrichtung der Kamera
